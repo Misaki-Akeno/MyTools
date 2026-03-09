@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# system
+.DS_Store
+
