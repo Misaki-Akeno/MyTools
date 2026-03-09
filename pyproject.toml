@@ -5,6 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "imagehash>=4.3.2",
     "numpy>=2.4.2",
     "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.1.1",
+    "structlog>=25.5.0",
+    "typer>=0.24.1",
 ]

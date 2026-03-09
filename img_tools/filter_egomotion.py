@@ -21,37 +21,55 @@ filter_egomotion.py
 
 from __future__ import annotations
 
-import argparse
-import logging
 import os
 import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import NamedTuple
+from typing import Annotated, NamedTuple, Optional
 
 import cv2
 import numpy as np
+import structlog
+import typer
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+# ─── 日志配置 ─────────────────────────────────────────────────────────────────
+
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO
 )
-log = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 FFMPEG = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
 
+app = typer.Typer(
+    name="filter-egomotion",
+    help="检测并处理视频中的相机 Ego-motion（剧烈自我运动）",
+    no_args_is_help=True,
+    add_completion=False,
+)
 
-# ─── 数据结构 ──────────────────────────────────────────────────────────────────
+
+# ─── 类型定义 ──────────────────────────────────────────────────────────────────
+
+class Task(str, Enum):
+    classify = "classify"
+    trim = "trim"
+    all = "all"
+
 
 class EgoMotionResult(NamedTuple):
-    has_egomotion: bool          # 是否存在 ego-motion
-    cut_time: float | None       # 建议裁剪点（秒），None 表示全程无 ego-motion
-    max_flow: float              # 全程最大光流幅度
-    motion_segments: list[tuple[float, float]]  # [(start_sec, end_sec), ...]
+    has_egomotion: bool
+    cut_time: float | None
+    max_flow: float
+    motion_segments: list[tuple[float, float]]
 
 
 # ─── 光流检测核心 ──────────────────────────────────────────────────────────────
@@ -61,16 +79,10 @@ def compute_global_flow(frame1_gray: np.ndarray, frame2_gray: np.ndarray) -> flo
     flow = cv2.calcOpticalFlowFarneback(
         frame1_gray, frame2_gray,
         None,
-        pyr_scale=0.5,
-        levels=3,
-        winsize=15,
-        iterations=3,
-        poly_n=5,
-        poly_sigma=1.2,
-        flags=0,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
     )
     magnitude = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
-    # 使用中值而非均值，对噪声更鲁棒
     return float(np.median(magnitude))
 
 
@@ -83,31 +95,17 @@ def detect_egomotion(
     tail_window: float = 5.0,
     resize_width: int = 320,
 ) -> EgoMotionResult:
-    """
-    对单个视频进行 ego-motion 检测。
-
-    Args:
-        video_path:    视频文件路径
-        threshold:     全局光流幅度阈值（像素/帧），超过则视为运动帧
-        min_duration:  连续运动帧持续时间（秒），达到后才算一段 ego-motion
-        fps_sample:    每秒采样帧数
-        full_scan:     True=全程扫描；False=仅检测末尾 tail_window 秒
-        tail_window:   末尾检测窗口（秒），full_scan=False 时有效
-        resize_width:  缩放宽度（加速计算）
-    """
+    """对单个视频进行 ego-motion 检测。"""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        log.warning("无法打开视频：%s", video_path.name)
+        log.warning("无法打开视频", file=video_path.name)
         return EgoMotionResult(False, None, 0.0, [])
 
     total_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     total_duration = total_frames / total_fps
-
-    # 计算采样间隔（帧数）
     frame_interval = max(1, int(total_fps / fps_sample))
 
-    # 确定扫描起始帧
     if full_scan:
         start_frame = 0
     else:
@@ -118,8 +116,6 @@ def detect_egomotion(
 
     prev_gray: np.ndarray | None = None
     frame_idx = start_frame
-
-    # 每个采样点的时间戳 + 光流幅度
     timestamps: list[float] = []
     flows: list[float] = []
 
@@ -127,27 +123,19 @@ def detect_egomotion(
         ret, frame = cap.read()
         if not ret:
             break
-
-        # 缩放以加速
         h, w = frame.shape[:2]
         if w > resize_width:
             scale = resize_width / w
             frame = cv2.resize(frame, (resize_width, int(h * scale)))
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         t = frame_idx / total_fps
-
         if prev_gray is not None:
             flow_mag = compute_global_flow(prev_gray, gray)
             timestamps.append(t)
             flows.append(flow_mag)
-
         prev_gray = gray
         frame_idx += frame_interval
-
-        # 跳到下一个采样帧
-        next_frame = frame_idx
-        cap.set(cv2.CAP_PROP_POS_FRAMES, next_frame)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
 
     cap.release()
 
@@ -155,11 +143,9 @@ def detect_egomotion(
         return EgoMotionResult(False, None, 0.0, [])
 
     max_flow = max(flows)
-
-    # ── 检测连续超阈值片段 ──────────────────────────────────────────────────────
     motion_segments: list[tuple[float, float]] = []
     seg_start: float | None = None
-    dt = 1.0 / fps_sample  # 两个采样点之间的时间间隔
+    dt = 1.0 / fps_sample
 
     for i, (t, f) in enumerate(zip(timestamps, flows)):
         if f >= threshold:
@@ -173,7 +159,6 @@ def detect_egomotion(
                     motion_segments.append((seg_start, seg_end + dt))
                 seg_start = None
 
-    # 收尾：视频结束时仍在运动
     if seg_start is not None:
         seg_end = timestamps[-1]
         duration = seg_end - seg_start + dt
@@ -181,12 +166,9 @@ def detect_egomotion(
             motion_segments.append((seg_start, seg_end + dt))
 
     has_egomotion = len(motion_segments) > 0
-
-    # 建议裁剪点：第一段 ego-motion 的起始时间（保留之前的画面）
     cut_time: float | None = None
     if has_egomotion:
         cut_time = motion_segments[0][0]
-        # 避免裁剪点过小（若 ego-motion 在最开始就出现，保留 0 秒无意义）
         if cut_time < 0.5:
             cut_time = 0.0
 
@@ -206,31 +188,28 @@ def classify_video(
 ) -> tuple[Path, EgoMotionResult]:
     """对单个视频分类，复制到对应目录。"""
     result = detect_egomotion(
-        video_path,
-        threshold=threshold,
-        min_duration=min_duration,
-        fps_sample=fps_sample,
-        full_scan=True,  # 分类时全程扫描
+        video_path, threshold=threshold, min_duration=min_duration,
+        fps_sample=fps_sample, full_scan=True,
     )
-
     target_dir = out_noisy if result.has_egomotion else out_clean
     dest = target_dir / video_path.name
-
     label = "有剧烈运动" if result.has_egomotion else "无剧烈运动"
-    segs = f" | 片段: {result.motion_segments}" if result.motion_segments else ""
+
     log.info(
-        "[%s] %s  (max_flow=%.1f%s)",
-        label, video_path.name, result.max_flow, segs,
+        f"[{label}]",
+        file=video_path.name,
+        max_flow=round(result.max_flow, 1),
+        segments=result.motion_segments or None,
     )
 
     if not dry_run:
         if dest.exists():
-            log.debug("已存在，跳过复制：%s", dest.name)
+            log.debug("已存在，跳过复制", file=dest.name)
         else:
             try:
-                os.link(video_path, dest)  # 尝试硬链接（不占额外空间）
+                os.link(video_path, dest)
             except OSError:
-                shutil.copy2(video_path, dest)  # 跨设备则复制
+                shutil.copy2(video_path, dest)
 
     return video_path, result
 
@@ -246,37 +225,30 @@ def trim_video(
     tail_window: float,
     dry_run: bool,
 ) -> tuple[Path, bool]:
-    """
-    对单个视频检测末尾 ego-motion，裁剪后输出。
-    若无 ego-motion，跳过（不输出）。
-    """
+    """检测末尾 ego-motion 并裁剪。"""
     result = detect_egomotion(
-        video_path,
-        threshold=threshold,
-        min_duration=min_duration,
-        fps_sample=fps_sample,
-        full_scan=False,  # 裁剪任务只看末尾
-        tail_window=tail_window,
+        video_path, threshold=threshold, min_duration=min_duration,
+        fps_sample=fps_sample, full_scan=False, tail_window=tail_window,
     )
 
     if not result.has_egomotion:
-        log.info("[跳过] %s  (无末尾运动, max_flow=%.1f)", video_path.name, result.max_flow)
+        log.info("[跳过]", file=video_path.name, max_flow=round(result.max_flow, 1),
+                 reason="无末尾运动")
         return video_path, False
 
     cut_time = result.cut_time
     if cut_time is None or cut_time <= 0.5:
-        log.warning("[跳过] %s  (裁剪点 %.1fs 过小，整段可能都是运动)", video_path.name, cut_time or 0)
+        log.warning("[跳过]", file=video_path.name, cut_time=cut_time,
+                    reason="裁剪点过小，整段可能都是运动")
         return video_path, False
 
     dest = out_trimmed / video_path.name
-    log.info(
-        "[裁剪] %s  →  %.2fs 处截断  (max_flow=%.1f, 片段: %s)",
-        video_path.name, cut_time, result.max_flow, result.motion_segments,
-    )
+    log.info("[裁剪]", file=video_path.name, cut_at_sec=round(cut_time, 2),
+             max_flow=round(result.max_flow, 1), segments=result.motion_segments)
 
     if not dry_run:
         if dest.exists():
-            log.debug("已存在，跳过：%s", dest.name)
+            log.debug("已存在，跳过", file=dest.name)
         else:
             _ffmpeg_trim(video_path, dest, cut_time)
 
@@ -287,16 +259,13 @@ def _ffmpeg_trim(src: Path, dst: Path, duration: float) -> None:
     """用 ffmpeg 无损截取视频前 duration 秒。"""
     if not Path(FFMPEG).exists():
         raise RuntimeError(f"找不到 ffmpeg：{FFMPEG}，请运行 brew install ffmpeg")
-
     cmd = [
-        FFMPEG,
-        "-hide_banner", "-loglevel", "error",
+        FFMPEG, "-hide_banner", "-loglevel", "error",
         "-i", str(src),
         "-t", f"{duration:.3f}",
-        "-c", "copy",          # 无损复制，速度快
+        "-c", "copy",
         "-avoid_negative_ts", "make_zero",
-        "-y",                  # 覆盖
-        str(dst),
+        "-y", str(dst),
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -305,131 +274,104 @@ def _ffmpeg_trim(src: Path, dst: Path, duration: float) -> None:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="检测并处理视频中的相机 Ego-motion（剧烈自我运动）",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        epilog="示例：uv run python img_tools/filter_egomotion.py 导出动态视频 --task all",
-    )
-    parser.add_argument(
-        "src",
-        nargs="?",
-        default="导出动态视频",
-        help="输入目录（包含 MP4 文件）",
-    )
-    parser.add_argument(
-        "--task",
-        choices=["classify", "trim", "all"],
-        default="all",
-        help="执行任务：classify=仅分类，trim=仅裁剪，all=分类+裁剪",
-    )
-    parser.add_argument(
-        "--out-clean",
-        default=None,
-        metavar="DIR",
-        help="无 ego-motion 视频输出目录（默认：<src>/../无剧烈运动）",
-    )
-    parser.add_argument(
-        "--out-noisy",
-        default=None,
-        metavar="DIR",
-        help="有 ego-motion 视频输出目录（默认：<src>/../有剧烈运动）",
-    )
-    parser.add_argument(
-        "--out-trimmed",
-        default=None,
-        metavar="DIR",
-        help="裁剪后视频输出目录（默认：<src>/../裁剪后）",
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=8.0,
-        metavar="FLOAT",
-        help="全局光流幅度阈值（像素/帧）",
-    )
-    parser.add_argument(
-        "--min-duration",
-        type=float,
-        default=0.4,
-        metavar="SEC",
-        help="触发 ego-motion 所需的最短连续运动时长（秒）",
-    )
-    parser.add_argument(
-        "--fps-sample",
-        type=int,
-        default=6,
-        metavar="N",
-        help="每秒采样帧数（越大越精确，越慢）",
-    )
-    parser.add_argument(
-        "--tail-window",
-        type=float,
-        default=5.0,
-        metavar="SEC",
-        help="裁剪任务：从末尾往前检测的秒数",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=4,
-        metavar="N",
-        help="并发线程数",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="仅分析，不复制/裁剪文件",
-    )
-    args = parser.parse_args()
+@app.command()
+def main(
+    src: Annotated[
+        Path,
+        typer.Argument(help="输入目录（包含 MP4 文件）"),
+    ] = Path("导出动态视频"),
+    task: Annotated[
+        Task,
+        typer.Option("--task", "-t", help="执行任务：classify=仅分类，trim=仅裁剪，all=两者"),
+    ] = Task.all,
+    out_clean: Annotated[
+        Optional[Path],
+        typer.Option("--out-clean", help="无 ego-motion 视频输出目录（默认：<src>/../无剧烈运动）"),
+    ] = None,
+    out_noisy: Annotated[
+        Optional[Path],
+        typer.Option("--out-noisy", help="有 ego-motion 视频输出目录（默认：<src>/../有剧烈运动）"),
+    ] = None,
+    out_trimmed: Annotated[
+        Optional[Path],
+        typer.Option("--out-trimmed", help="裁剪后视频输出目录（默认：<src>/../裁剪后）"),
+    ] = None,
+    threshold: Annotated[
+        float,
+        typer.Option("--threshold", help="全局光流幅度阈值（像素/帧）"),
+    ] = 8.0,
+    min_duration: Annotated[
+        float,
+        typer.Option("--min-duration", help="触发 ego-motion 所需的最短连续运动时长（秒）"),
+    ] = 0.4,
+    fps_sample: Annotated[
+        int,
+        typer.Option("--fps-sample", min=1, help="每秒采样帧数"),
+    ] = 6,
+    tail_window: Annotated[
+        float,
+        typer.Option("--tail-window", help="裁剪任务：从末尾往前检测的秒数"),
+    ] = 5.0,
+    workers: Annotated[
+        int,
+        typer.Option("--workers", "-w", min=1, help="并发线程数"),
+    ] = 4,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="仅分析，不复制/裁剪文件"),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="输出调试日志"),
+    ] = False,
+) -> None:
+    """检测并处理视频中的相机 Ego-motion（剧烈自我运动）。"""
+    if verbose:
+        structlog.configure(
+            wrapper_class=structlog.make_filtering_bound_logger(10)
+        )
 
-    src_dir = Path(args.src).expanduser().resolve()
+    src_dir = src.expanduser().resolve()
     if not src_dir.exists():
-        log.error("输入目录不存在：%s", src_dir)
-        sys.exit(1)
+        log.error("输入目录不存在", path=str(src_dir))
+        raise typer.Exit(1)
 
     parent = src_dir.parent
+    clean_dir   = (out_clean.expanduser().resolve()   if out_clean   else parent / "无剧烈运动")
+    noisy_dir   = (out_noisy.expanduser().resolve()   if out_noisy   else parent / "有剧烈运动")
+    trimmed_dir = (out_trimmed.expanduser().resolve() if out_trimmed else parent / "裁剪后")
 
-    out_clean   = Path(args.out_clean).expanduser().resolve()   if args.out_clean   else parent / "无剧烈运动"
-    out_noisy   = Path(args.out_noisy).expanduser().resolve()   if args.out_noisy   else parent / "有剧烈运动"
-    out_trimmed = Path(args.out_trimmed).expanduser().resolve() if args.out_trimmed else parent / "裁剪后"
+    do_classify = task in (Task.classify, Task.all)
+    do_trim     = task in (Task.trim, Task.all)
 
-    do_classify = args.task in ("classify", "all")
-    do_trim     = args.task in ("trim", "all")
-
-    if not args.dry_run:
+    if not dry_run:
         if do_classify:
-            out_clean.mkdir(parents=True, exist_ok=True)
-            out_noisy.mkdir(parents=True, exist_ok=True)
+            clean_dir.mkdir(parents=True, exist_ok=True)
+            noisy_dir.mkdir(parents=True, exist_ok=True)
         if do_trim:
-            out_trimmed.mkdir(parents=True, exist_ok=True)
+            trimmed_dir.mkdir(parents=True, exist_ok=True)
 
-    # 收集视频文件
     videos = sorted(p for p in src_dir.iterdir() if p.suffix.lower() == ".mp4" and p.is_file())
     if not videos:
-        log.info("没有找到 MP4 文件：%s", src_dir)
+        log.info("没有找到 MP4 文件", path=str(src_dir))
         return
 
-    log.info("找到 %d 个视频，阈值=%.1f，采样=%d fps，并发=%d",
-             len(videos), args.threshold, args.fps_sample, args.workers)
-    if args.dry_run:
+    log.info("找到视频文件", count=len(videos), threshold=threshold,
+             fps_sample=fps_sample, workers=workers)
+    if dry_run:
         log.info("【DRY RUN】不会写入任何文件")
+
+    noisy_paths: list[Path] = []
 
     # ── Task 1: 分类 ────────────────────────────────────────────────────────────
     if do_classify:
-        log.info("━" * 56)
         log.info("▶ 开始分类（全程扫描）")
-
-        noisy_paths: list[Path] = []  # 记录有 ego-motion 的视频，供 trim 使用
         n_clean = n_noisy = 0
-
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
-                    classify_video,
-                    v, out_clean, out_noisy,
-                    args.threshold, args.min_duration, args.fps_sample,
-                    args.dry_run,
+                    classify_video, v, clean_dir, noisy_dir,
+                    threshold, min_duration, fps_sample, dry_run,
                 ): v
                 for v in videos
             }
@@ -442,30 +384,21 @@ def main() -> None:
                     else:
                         n_clean += 1
                 except Exception as e:
-                    log.error("分类出错 %s：%s", futures[future].name, e)
+                    log.error("分类出错", file=futures[future].name, error=str(e))
 
-        log.info("━" * 56)
-        log.info("分类完成：无剧烈运动 %d 个 → %s", n_clean, out_clean)
-        log.info("分类完成：有剧烈运动 %d 个 → %s", n_noisy, out_noisy)
+        log.info("分类完成", clean=n_clean, noisy=n_noisy,
+                 out_clean=str(clean_dir), out_noisy=str(noisy_dir))
 
     # ── Task 2: 裁剪 ────────────────────────────────────────────────────────────
     if do_trim:
-        # 如果只运行 trim（未先分类），则扫描所有视频
         trim_targets = noisy_paths if do_classify else videos
-
-        log.info("━" * 56)
-        log.info("▶ 开始裁剪（检测末尾 %.1fs 内的 ego-motion）", args.tail_window)
-
+        log.info("▶ 开始裁剪", tail_window=tail_window, targets=len(trim_targets))
         n_trimmed = n_skip = 0
-
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
-                    trim_video,
-                    v, out_trimmed,
-                    args.threshold, args.min_duration, args.fps_sample,
-                    args.tail_window,
-                    args.dry_run,
+                    trim_video, v, trimmed_dir,
+                    threshold, min_duration, fps_sample, tail_window, dry_run,
                 ): v
                 for v in trim_targets
             }
@@ -477,13 +410,12 @@ def main() -> None:
                     else:
                         n_skip += 1
                 except Exception as e:
-                    log.error("裁剪出错 %s：%s", futures[future].name, e)
+                    log.error("裁剪出错", file=futures[future].name, error=str(e))
 
-        log.info("━" * 56)
-        log.info("裁剪完成：已裁剪 %d 个，跳过 %d 个 → %s", n_trimmed, n_skip, out_trimmed)
+        log.info("裁剪完成", trimmed=n_trimmed, skipped=n_skip, out=str(trimmed_dir))
 
     log.info("全部完成！")
 
 
 if __name__ == "__main__":
-    main()
+    app()

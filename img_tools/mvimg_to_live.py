@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-mvimg_to_mp4.py
-~~~~~~~~~~~~~~~
+mvimg_to_live.py
+~~~~~~~~~~~~~~~~
 从安卓 MVIMG 动态照片中批量提取内嵌 MP4 短视频，输出到指定目录。
 
 用法：
-    uv run python mvimg_to_live.py [源目录] [--out 输出目录] [--workers N]
+    uv run python img_tools/mvimg_to_live.py [源目录] [--out 输出目录] [--workers N]
 
 示例：
-    uv run python mvimg_to_live.py /Volumes/Share/等待导入照片 --out ~/导出
+    uv run python img_tools/mvimg_to_live.py /Volumes/Share/等待导入照片 --out ~/导出
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import logging
 import os
 import shutil
 import struct
@@ -23,15 +21,30 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Annotated, Optional
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+import structlog
+import typer
+
+# ─── 日志配置 ─────────────────────────────────────────────────────────────────
+
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.dev.ConsoleRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO
 )
-log = logging.getLogger(__name__)
+log = structlog.get_logger()
 
 EXIFTOOL = shutil.which("exiftool") or "/opt/homebrew/bin/exiftool"
+
+app = typer.Typer(
+    name="mvimg-to-live",
+    help="从安卓 MVIMG 动态照片批量提取内嵌 MP4 视频",
+    no_args_is_help=True,
+    add_completion=False,
+)
 
 
 # ─── 读取 XMP:MicroVideoOffset ───────────────────────────────────────────────
@@ -76,7 +89,7 @@ def extract_mp4(mvimg_path: Path, out_dir: Path) -> bool:
     out_mp4 = out_dir / (mvimg_path.stem + ".mp4")
 
     if out_mp4.exists():
-        log.info("已存在，跳过：%s", out_mp4.name)
+        log.info("已存在，跳过", file=out_mp4.name)
         return True
 
     raw = mvimg_path.read_bytes()
@@ -88,10 +101,10 @@ def extract_mp4(mvimg_path: Path, out_dir: Path) -> bool:
         mp4_start = file_size - offset
         if raw[mp4_start + 4: mp4_start + 8] == b"ftyp":
             out_mp4.write_bytes(raw[mp4_start:])
-            # 保留原始文件的修改时间（大致对应拍摄时间）
             src_stat = mvimg_path.stat()
             os.utime(out_mp4, (src_stat.st_atime, src_stat.st_mtime))
-            log.info("✓ %s  →  %s  (%.1f MB)", mvimg_path.name, out_mp4.name, offset / 1e6)
+            log.info("✓ 提取成功", src=mvimg_path.name, dst=out_mp4.name,
+                     size_mb=round(offset / 1e6, 1))
             return True
 
     # 降级：magic 扫描
@@ -101,10 +114,11 @@ def extract_mp4(mvimg_path: Path, out_dir: Path) -> bool:
         out_mp4.write_bytes(mp4_data)
         src_stat = mvimg_path.stat()
         os.utime(out_mp4, (src_stat.st_atime, src_stat.st_mtime))
-        log.info("✓ %s  →  %s  (magic扫描, %.1f MB)", mvimg_path.name, out_mp4.name, len(mp4_data) / 1e6)
+        log.info("✓ 提取成功（magic扫描）", src=mvimg_path.name, dst=out_mp4.name,
+                 size_mb=round(len(mp4_data) / 1e6, 1))
         return True
 
-    log.warning("✗ 无内嵌视频，跳过：%s", mvimg_path.name)
+    log.warning("✗ 无内嵌视频，跳过", file=mvimg_path.name)
     return False
 
 
@@ -119,7 +133,6 @@ def find_mvimg_files(src_dir: Path) -> list[Path]:
         if not f.is_file():
             continue
         name_lower = f.name.lower()
-        # 明确匹配 MVIMG 命名
         if name_lower.startswith("mvimg_") and name_lower.endswith((".jpg", ".jpeg")):
             results.append(f)
         elif name_lower.endswith(".mp.jpg"):  # Pixel 新格式
@@ -127,9 +140,8 @@ def find_mvimg_files(src_dir: Path) -> list[Path]:
         elif name_lower.endswith((".jpg", ".jpeg")):
             all_jpgs.append(f)
 
-    # 对剩余普通 JPEG 批量检测 XMP 标签
     if all_jpgs:
-        log.info("检测剩余 %d 个 JPEG 是否含动态照片标记…", len(all_jpgs))
+        log.info("检测普通 JPEG 是否含动态照片标记", count=len(all_jpgs))
         r = subprocess.run(
             [EXIFTOOL, "-j", "-q", "-MicroVideo", "-MicroVideoOffset"]
             + [str(f) for f in all_jpgs],
@@ -150,72 +162,77 @@ def find_mvimg_files(src_dir: Path) -> list[Path]:
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="从安卓 MVIMG 动态照片批量提取内嵌 MP4 视频",
-        epilog="示例：uv run python mvimg_to_live.py /Volumes/Share/等待导入照片 --out ~/导出",
-    )
-    parser.add_argument("src", nargs="?", default="/Volumes/Share/等待导入照片",
-                        help="源目录（默认：/Volumes/Share/等待导入照片）")
-    parser.add_argument("--out", default=str(Path.home() / "导出"),
-                        help="输出目录（默认：~/导出）")
-    parser.add_argument("--workers", type=int, default=2, metavar="N",
-                        help="并发线程数（默认：2）")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="仅列出待处理文件，不执行提取")
-    args = parser.parse_args()
+@app.command()
+def main(
+    src: Annotated[
+        Path,
+        typer.Argument(help="源目录（含 MVIMG 动态照片）"),
+    ] = Path("/Volumes/Share/等待导入照片"),
+    out: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="输出目录"),
+    ] = Path.home() / "导出",
+    workers: Annotated[
+        int,
+        typer.Option("--workers", "-w", min=1, help="并发线程数"),
+    ] = 2,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="仅列出待处理文件，不执行提取"),
+    ] = False,
+    verbose: Annotated[
+        bool,
+        typer.Option("--verbose", "-v", help="输出调试日志"),
+    ] = False,
+) -> None:
+    """从安卓 MVIMG 动态照片批量提取内嵌 MP4 视频。"""
+    if verbose:
+        structlog.configure(
+            wrapper_class=structlog.make_filtering_bound_logger(10)
+        )
 
     if not Path(EXIFTOOL).exists():
         log.error("缺少 exiftool，请运行：brew install exiftool")
-        sys.exit(1)
+        raise typer.Exit(1)
 
-    src_dir = Path(args.src).expanduser().resolve()
-    out_dir = Path(args.out).expanduser().resolve()
+    src_dir = src.expanduser().resolve()
+    out_dir = out.expanduser().resolve()
 
     if not src_dir.exists():
-        log.error("源目录不存在：%s", src_dir)
-        sys.exit(1)
+        log.error("源目录不存在", path=str(src_dir))
+        raise typer.Exit(1)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log.info("源目录：%s", src_dir)
-    log.info("输出目录：%s", out_dir)
+    log.info("开始处理", src=str(src_dir), out=str(out_dir))
 
     files = find_mvimg_files(src_dir)
-    log.info("找到 %d 个 MVIMG 动态照片", len(files))
+    log.info("找到 MVIMG 动态照片", count=len(files))
 
     if not files:
-        log.info("没有找到需要处理的文件。")
+        log.info("没有找到需要处理的文件")
         return
 
-    if args.dry_run:
+    if dry_run:
         for f in files:
-            print(f)
+            typer.echo(str(f))
         return
+
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     success = fail = 0
-    if args.workers <= 1:
-        for f in files:
-            (success if extract_mp4(f, out_dir) else fail)
-            success += 1 if extract_mp4(f, out_dir) else 0
-    else:
-        # 避免上面的 bug，重写
-        success = fail = 0
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(extract_mp4, f, out_dir): f for f in files}
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        success += 1
-                    else:
-                        fail += 1
-                except Exception as e:
-                    log.error("处理 %s 时出错：%s", futures[future].name, e)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(extract_mp4, f, out_dir): f for f in files}
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    success += 1
+                else:
                     fail += 1
+            except Exception as e:
+                log.error("处理出错", file=futures[future].name, error=str(e))
+                fail += 1
 
-    log.info("━" * 48)
-    log.info("完成！成功 %d 个，跳过/失败 %d 个", success, fail)
-    log.info("输出目录：%s", out_dir)
+    log.info("全部完成", success=success, failed=fail, out=str(out_dir))
 
 
 if __name__ == "__main__":
-    main()
+    app()
